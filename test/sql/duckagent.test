@@ -1,0 +1,23 @@
+# name: test/sql/duckagent.test
+# description: test duckagent extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT duckagent('Sam');
+----
+Catalog Error: Scalar Function with name duckagent does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require duckagent
+
+# Confirm the extension works
+query I
+SELECT duckagent('Sam');
+----
+...........🦆 Sam
+
+query I
+SELECT duckagent_openssl_version('Michael') ILIKE 'Duckagent Michael, my linked OpenSSL version is OpenSSL%';
+----
+true
