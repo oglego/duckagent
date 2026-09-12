@@ -461,6 +461,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction ai_enrich_fun("ai_enrich", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalTypeId::STRUCT,
 	                             AIEnrichFun, AIEnrichBind, /*bind_extended=*/nullptr, /*statistics=*/nullptr,
 	                             AIEnrichInitLocalState);
+	ai_enrich_fun.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	loader.RegisterFunction(ai_enrich_fun);
 }
 
