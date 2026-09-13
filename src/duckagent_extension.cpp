@@ -199,8 +199,16 @@ static std::shared_ptr<agent_cpp::ModelWeights> GetSharedModelWeights() {
 //===--------------------------------------------------------------------===//
 // Builds a grammar that constrains generation to exactly
 // {"field1":"...", "field2":"...", ...} in schema order, all string values.
-// The `string`/`ws` rules are lifted directly from llama.cpp's own
-// grammars/json.gbnf reference grammar.
+// The `string`/`ws` rules are adapted from llama.cpp's own
+// grammars/json.gbnf reference grammar, with one important addition: a
+// hard length cap on the string body (kEnrichMaxFieldValueLength).
+// agent.cpp's generate loop has no token-count/max-tokens cap of its own
+// (it only stops on EOS or on running out of the full context window), so
+// without this bound a model that doesn't "want" to stop can ramble for
+// hundreds of characters - or run all the way to context exhaustion,
+// getting cut off mid-sentence - while staying perfectly grammar-valid
+// the whole time. This bound is what actually prevents that, independent
+// of which model is loaded.
 static string EscapeGbnfLiteral(const string &field_name) {
 	string escaped;
 	escaped.reserve(field_name.size());
@@ -213,14 +221,10 @@ static string EscapeGbnfLiteral(const string &field_name) {
 	return escaped;
 }
 
-static const char *kEnrichGrammarStringAndWsRules =
-    "string ::=\n"
-    "  \"\\\"\" (\n"
-    "    [^\"\\\\\\x7F\\x00-\\x1F] |\n"
-    "    \"\\\\\" ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{4})\n"
-    "  )* \"\\\"\" ws\n"
-    "\n"
-    "ws ::= | \" \" | \"\\n\" [ \\t]{0,20}\n";
+// Max characters (roughly) allowed inside a single field's JSON string
+// value. Generous enough for "San Francisco, California" or a short
+// industry description, tight enough to make runaway generation impossible.
+static constexpr idx_t kEnrichMaxFieldValueLength = 120;
 
 static string BuildEnrichGrammar(const vector<string> &field_names) {
 	string root = "root ::= \"{\" ws";
@@ -231,7 +235,16 @@ static string BuildEnrichGrammar(const vector<string> &field_names) {
 		root += " \"\\\"" + EscapeGbnfLiteral(field_names[i]) + "\\\":\" ws string";
 	}
 	root += " \"}\" ws\n\n";
-	return root + kEnrichGrammarStringAndWsRules;
+
+	string grammar = root;
+	grammar += "string ::=\n";
+	grammar += "  \"\\\"\" (\n";
+	grammar += "    [^\"\\\\\\x7F\\x00-\\x1F] |\n";
+	grammar += "    \"\\\\\" ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{4})\n";
+	grammar += "  ){0," + std::to_string(kEnrichMaxFieldValueLength) + "} \"\\\"\" ws\n";
+	grammar += "\n";
+	grammar += "ws ::= | \" \" | \"\\n\" [ \\t]{0,20}\n";
+	return grammar;
 }
 
 static string BuildEnrichInstructions(const vector<string> &field_names) {
@@ -379,6 +392,12 @@ static bool LooksGarbled(const string &value) {
 	if (value.empty()) {
 		return true;
 	}
+	// Defense-in-depth alongside the grammar-level length cap
+	// (kEnrichMaxFieldValueLength): a genuine short factual field value
+	// should never be a multi-sentence essay.
+	if (value.size() > kEnrichMaxFieldValueLength) {
+		return true;
+	}
 	for (char c : value) {
 		if (c == '<' || c == '>' || c == '{' || c == '}' || c == '[' || c == ']') {
 			return true;
@@ -414,6 +433,32 @@ static bool GenerateEnrichmentFields(agent_cpp::Agent &agent, const string &cont
 		return false;
 	}
 	return TryParseFlatJSONObjectStrings(response_text, out);
+}
+
+//===--------------------------------------------------------------------===//
+// Minor formatting cleanup for otherwise-good generated values
+//===--------------------------------------------------------------------===//
+// Some models prefix numeric-looking values with a stray '+' (e.g. year
+// values come back as "+1916" instead of "1916"). That's cosmetic noise on
+// an otherwise correct value, not the kind of structural problem
+// LooksGarbled() is meant to catch - stripping it here means a good value
+// doesn't get discarded (and potentially replaced by a worse retry) over
+// formatting alone.
+static void NormalizeFieldValue(string &value) {
+	idx_t start = 0;
+	while (start < value.size() &&
+	       (value[start] == '+' || isspace(static_cast<unsigned char>(value[start])))) {
+		start++;
+	}
+	if (start > 0) {
+		value.erase(0, start);
+	}
+}
+
+static void NormalizeParsedFields(std::unordered_map<string, string> &fields) {
+	for (auto &entry : fields) {
+		NormalizeFieldValue(entry.second);
+	}
 }
 
 
@@ -508,6 +553,9 @@ static void AIEnrichFun(DataChunk &args, ExpressionState &state, Vector &result)
 
 		std::unordered_map<string, string> primary;
 		bool primary_ok = GenerateEnrichmentFields(*lstate.agent, row_content, primary);
+		if (primary_ok) {
+			NormalizeParsedFields(primary);
+		}
 
 		bool any_field_needs_retry = false;
 		for (auto &field : info.field_names) {
@@ -521,6 +569,7 @@ static void AIEnrichFun(DataChunk &args, ExpressionState &state, Vector &result)
 		std::unordered_map<string, string> retry;
 		if (any_field_needs_retry) {
 			GenerateEnrichmentFields(*lstate.retry_agent, row_content, retry);
+			NormalizeParsedFields(retry);
 			// Result (success or failure) is checked per-field below; a
 			// failed/garbled retry for a given field just leaves it NULL.
 		}
