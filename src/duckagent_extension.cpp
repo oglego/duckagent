@@ -12,6 +12,7 @@
 #include "agent.h"
 #include "error.h"
 #include "model.h"
+#include "llama.h"
 
 #include <cstdlib>
 #include <mutex>
@@ -148,6 +149,16 @@ static unique_ptr<FunctionData> AIEnrichBind(ClientContext &context, ScalarFunct
 //===--------------------------------------------------------------------===//
 // agent.cpp model loading
 //===--------------------------------------------------------------------===//
+// llama_log_set() forwards internally to ggml_log_set() as well, so a
+// single no-op callback silences everything from model-load progress and
+// KV cache messages down to backend-level logs like Metal's
+// "ggml_metal_free: deallocating" - all of which otherwise print straight
+// to stderr with no per-call way to suppress them.
+// TODO: make this configurable (e.g. DUCKAGENT_VERBOSE=1) if the logs turn
+// out to be useful for debugging later.
+static void SilentGgmlLogCallback(ggml_log_level /*level*/, const char * /*text*/, void * /*user_data*/) {
+}
+
 // Weights are the expensive part (the GGUF file itself) and are shared
 // across every ai_enrich call in the process. Each call site gets its own
 // Model (own KV cache/context) via Model::create_with_weights, since
@@ -164,6 +175,8 @@ static std::shared_ptr<agent_cpp::ModelWeights> GetSharedModelWeights() {
 	if (weights) {
 		return weights;
 	}
+
+	llama_log_set(SilentGgmlLogCallback, nullptr);
 
 	const char *model_path_env = std::getenv("DUCKAGENT_MODEL_PATH");
 	if (!model_path_env || string(model_path_env).empty()) {
@@ -352,13 +365,65 @@ static bool TryParseFlatJSONObjectStrings(const string &json, std::unordered_map
 }
 
 //===--------------------------------------------------------------------===//
-// ai_enrich: per-thread local state
+// Sanity check for generated field values
 //===--------------------------------------------------------------------===//
+// Grammar-constrained decoding only guarantees syntactic validity (a legal
+// JSON string), not that the *content* is sane. A weak/small model at
+// temp=0 (fully greedy) can walk into a degenerate path for a fact it
+// doesn't confidently know and produce junk that is still grammar-legal -
+// stray structural characters, echoed prompt fragments, etc. This is a
+// cheap, model-agnostic heuristic to catch that class of failure: a
+// genuine short factual answer ("San Francisco", "Aerospace") should never
+// contain JSON/HTML structural characters or come back empty.
+static bool LooksGarbled(const string &value) {
+	if (value.empty()) {
+		return true;
+	}
+	for (char c : value) {
+		if (c == '<' || c == '>' || c == '{' || c == '}') {
+			return true;
+		}
+	}
+	return false;
+}
+
+//===--------------------------------------------------------------------===//
+// Runs one full agent turn for a row and parses the result.
+// Returns false if generation threw or the response didn't parse as the
+// flat JSON object our grammar guarantees - callers still need to check
+// individual field values with LooksGarbled() even when this returns true.
+//===--------------------------------------------------------------------===//
+static bool GenerateEnrichmentFields(agent_cpp::Agent &agent, const string &content,
+                                      std::unordered_map<string, string> &out) {
+	std::vector<common_chat_msg> messages;
+	common_chat_msg user_msg;
+	user_msg.role = "user";
+	user_msg.content = content;
+	messages.push_back(std::move(user_msg));
+
+	string response_text;
+	try {
+		response_text = agent.run_loop(messages);
+	} catch (const agent_cpp::Error &e) {
+		return false;
+	}
+	return TryParseFlatJSONObjectStrings(response_text, out);
+}
+
+
 // Holds a fully-configured Agent (model + grammar baked in for this call
 // site's schema, no tools in v1) so it's built once and reused across every
 // DataChunk processed on this thread, not reloaded per row or per chunk.
+// Retry generation uses a nonzero temperature specifically to escape a
+// greedy (temp=0) decode that walked into a degenerate path - a different
+// sampling path is often enough to dodge the same dead end. Only used for
+// fields that fail LooksGarbled() on the primary (temp=0) attempt, so
+// well-behaved rows never pay this extra generation cost.
+static constexpr float kEnrichRetryTemperature = 0.7F;
+
 struct AIEnrichLocalState : public FunctionLocalState {
 	std::shared_ptr<agent_cpp::Agent> agent;
+	std::shared_ptr<agent_cpp::Agent> retry_agent;
 };
 
 static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &/*state*/,
@@ -367,26 +432,35 @@ static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &/*
 	auto &info = bind_data_p->Cast<AIEnrichBindData>();
 
 	auto weights = GetSharedModelWeights();
+	auto grammar = BuildEnrichGrammar(info.field_names);
+	string instructions = BuildEnrichInstructions(info.field_names);
 
-	agent_cpp::ModelConfig model_config;
-	model_config.grammar = BuildEnrichGrammar(info.field_names);
-	model_config.grammar_root = "root";
-	model_config.temp = 0.0F; // deterministic: field extraction, not creative writing
+	agent_cpp::ModelConfig primary_config;
+	primary_config.grammar = grammar;
+	primary_config.grammar_root = "root";
+	primary_config.temp = 0.0F; // deterministic: field extraction, not creative writing
+
+	agent_cpp::ModelConfig retry_config;
+	retry_config.grammar = grammar;
+	retry_config.grammar_root = "root";
+	retry_config.temp = kEnrichRetryTemperature;
 
 	std::shared_ptr<agent_cpp::Model> model;
+	std::shared_ptr<agent_cpp::Model> retry_model;
 	try {
-		model = agent_cpp::Model::create_with_weights(weights, model_config);
+		model = agent_cpp::Model::create_with_weights(weights, primary_config);
+		retry_model = agent_cpp::Model::create_with_weights(weights, retry_config);
 	} catch (const agent_cpp::ModelError &e) {
 		throw IOException("ai_enrich: failed to initialize model context: %s", e.what());
 	}
 
-	std::vector<std::unique_ptr<agent_cpp::Tool>> tools; // none in v1 - no grounding
-	std::vector<std::unique_ptr<agent_cpp::Callback>> callbacks;
-	string instructions = BuildEnrichInstructions(info.field_names);
-
 	auto local_state = make_uniq<AIEnrichLocalState>();
-	local_state->agent = std::make_shared<agent_cpp::Agent>(std::move(model), std::move(tools),
-	                                                         std::move(callbacks), instructions);
+	local_state->agent = std::make_shared<agent_cpp::Agent>(
+	    std::move(model), std::vector<std::unique_ptr<agent_cpp::Tool>>{},
+	    std::vector<std::unique_ptr<agent_cpp::Callback>>{}, instructions);
+	local_state->retry_agent = std::make_shared<agent_cpp::Agent>(
+	    std::move(retry_model), std::vector<std::unique_ptr<agent_cpp::Tool>>{},
+	    std::vector<std::unique_ptr<agent_cpp::Callback>>{}, instructions);
 	return local_state;
 }
 
@@ -395,7 +469,10 @@ static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &/*
 //===--------------------------------------------------------------------===//
 // Runs one agent turn per row: row content in as the user message,
 // grammar-constrained JSON out, parsed into the STRUCT's child vectors.
-// A row that fails to generate or parse comes back NULL rather than
+// Any field value that fails LooksGarbled() triggers a single whole-row
+// retry at a nonzero temperature; only the fields that were actually bad
+// are replaced from the retry (good primary values are kept as-is). A
+// field that's still bad after the retry comes back NULL rather than
 // aborting the whole query.
 static void AIEnrichFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
@@ -421,33 +498,46 @@ static void AIEnrichFun(DataChunk &args, ExpressionState &state, Vector &result)
 			}
 			continue;
 		}
+		string row_content = content_values[content_idx].GetString();
 
-		std::vector<common_chat_msg> messages;
-		common_chat_msg user_msg;
-		user_msg.role = "user";
-		user_msg.content = content_values[content_idx].GetString();
-		messages.push_back(std::move(user_msg));
+		std::unordered_map<string, string> primary;
+		bool primary_ok = GenerateEnrichmentFields(*lstate.agent, row_content, primary);
 
-		string response_text;
-		bool generation_ok = true;
-		try {
-			response_text = lstate.agent->run_loop(messages);
-		} catch (const agent_cpp::Error &e) {
-			// Don't abort the whole query over one row's generation failure.
-			generation_ok = false;
+		bool any_field_needs_retry = false;
+		for (auto &field : info.field_names) {
+			auto it = primary_ok ? primary.find(field) : primary.end();
+			if (it == primary.end() || LooksGarbled(it->second)) {
+				any_field_needs_retry = true;
+				break;
+			}
 		}
 
-		std::unordered_map<string, string> parsed;
-		bool parse_ok = generation_ok && TryParseFlatJSONObjectStrings(response_text, parsed);
+		std::unordered_map<string, string> retry;
+		if (any_field_needs_retry) {
+			GenerateEnrichmentFields(*lstate.retry_agent, row_content, retry);
+			// Result (success or failure) is checked per-field below; a
+			// failed/garbled retry for a given field just leaves it NULL.
+		}
 
 		for (idx_t child_idx = 0; child_idx < child_entries.size(); child_idx++) {
 			auto &child_vector = *child_entries[child_idx];
 			auto child_data = FlatVector::GetData<string_t>(child_vector);
-			auto it = parse_ok ? parsed.find(info.field_names[child_idx]) : parsed.end();
-			if (it == parsed.end()) {
-				FlatVector::SetNull(child_vector, row, true);
+			const auto &field = info.field_names[child_idx];
+
+			auto primary_it = primary_ok ? primary.find(field) : primary.end();
+			bool primary_good = primary_it != primary.end() && !LooksGarbled(primary_it->second);
+
+			if (primary_good) {
+				child_data[row] = StringVector::AddString(child_vector, primary_it->second);
+				continue;
+			}
+
+			auto retry_it = retry.find(field);
+			bool retry_good = retry_it != retry.end() && !LooksGarbled(retry_it->second);
+			if (retry_good) {
+				child_data[row] = StringVector::AddString(child_vector, retry_it->second);
 			} else {
-				child_data[row] = StringVector::AddString(child_vector, it->second);
+				FlatVector::SetNull(child_vector, row, true);
 			}
 		}
 	}
