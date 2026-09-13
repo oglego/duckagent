@@ -380,9 +380,15 @@ static bool LooksGarbled(const string &value) {
 		return true;
 	}
 	for (char c : value) {
-		if (c == '<' || c == '>' || c == '{' || c == '}') {
+		if (c == '<' || c == '>' || c == '{' || c == '}' || c == '[' || c == ']') {
 			return true;
 		}
+	}
+	if (value.rfind("http://", 0) == 0 || value.rfind("https://", 0) == 0) {
+		return true;
+	}
+	if (value[0] == '/') {
+		return true;
 	}
 	return false;
 }
