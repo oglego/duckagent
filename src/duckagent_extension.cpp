@@ -6,6 +6,8 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/main/connection.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
 // agent.cpp - local LLM agent runtime (see CMakeLists.txt FetchContent block)
@@ -17,6 +19,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <thread>
+#include <algorithm>
 
 namespace duckdb {
 
@@ -477,7 +481,7 @@ struct AIEnrichLocalState : public FunctionLocalState {
 	std::shared_ptr<agent_cpp::Agent> retry_agent;
 };
 
-static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &/*state*/,
+static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &state,
                                                               const BoundFunctionExpression &/*expr*/,
                                                               FunctionData *bind_data_p) {
 	auto &info = bind_data_p->Cast<AIEnrichBindData>();
@@ -486,15 +490,34 @@ static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &/*
 	auto grammar = BuildEnrichGrammar(info.field_names);
 	string instructions = BuildEnrichInstructions(info.field_names);
 
+	// agent.cpp's default ModelConfig::n_threads is
+	// hardware_concurrency() - 1 - i.e. each Model context tries to claim
+	// nearly the whole machine for itself. DuckDB will call this
+	// init-local-state callback once per worker thread when a query runs
+	// in parallel (e.g. scanning a large table), so left at the default,
+	// N parallel DuckDB threads would each spin up a Model context also
+	// trying to grab ~all cores - oversubscribing the machine and making
+	// parallelism actively counterproductive rather than a speedup. Divide
+	// available cores across DuckDB's own configured thread count instead,
+	// so DuckDB-level row parallelism is the thing doing the scaling.
+	auto num_duckdb_threads =
+	    static_cast<idx_t>(std::max<int32_t>(1, TaskScheduler::GetScheduler(state.GetContext()).NumberOfThreads()));
+	auto hw_threads = std::max<unsigned>(1U, std::thread::hardware_concurrency());
+	auto threads_per_context = std::max<idx_t>(1, hw_threads / num_duckdb_threads);
+
 	agent_cpp::ModelConfig primary_config;
 	primary_config.grammar = grammar;
 	primary_config.grammar_root = "root";
 	primary_config.temp = 0.0F; // deterministic: field extraction, not creative writing
+	primary_config.n_threads = static_cast<int>(threads_per_context);
+	primary_config.n_threads_batch = static_cast<int>(threads_per_context);
 
 	agent_cpp::ModelConfig retry_config;
 	retry_config.grammar = grammar;
 	retry_config.grammar_root = "root";
 	retry_config.temp = kEnrichRetryTemperature;
+	retry_config.n_threads = static_cast<int>(threads_per_context);
+	retry_config.n_threads_batch = static_cast<int>(threads_per_context);
 
 	std::shared_ptr<agent_cpp::Model> model;
 	std::shared_ptr<agent_cpp::Model> retry_model;
@@ -608,6 +631,53 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             AIEnrichInitLocalState);
 	ai_enrich_fun.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	loader.RegisterFunction(ai_enrich_fun);
+
+	//===----------------------------------------------------------------===//
+	// ai_enrich_distinct: enrich once per distinct key, not once per row
+	//===----------------------------------------------------------------===//
+	// ai_enrich runs a real LLM generation per call - fine for a handful of
+	// rows, prohibitively slow across e.g. 100K rows of a low-cardinality
+	// column (a company name, a category, a product line) where the actual
+	// number of *distinct* values is a tiny fraction of the row count.
+	//
+	// This macro does the dedup-then-broadcast pattern that pattern calls
+	// for automatically:
+	//   1. SELECT DISTINCT ON (key_column) picks exactly one representative
+	//      row per distinct key value, while keeping every other column
+	//      from that row in scope - so content_expr can reference any
+	//      column of `source`, not just key_column.
+	//   2. ai_enrich runs exactly once per distinct key.
+	//   3. The caller joins the (small) result back onto the full table
+	//      via ai_enrich_distinct_key.
+	//
+	// `source` is passed as a bare relation reference (e.g. a table name);
+	// `source::VARCHAR` yields its qualified name for query_table() to
+	// resolve, following the same convention DuckDB's own built-in table
+	// macros (e.g. histogram_values) use for accepting "any relation".
+	//
+	// Example:
+	//   SELECT t.*, e.enrichment.*
+	//   FROM big_table t
+	//   JOIN ai_enrich_distinct(
+	//       big_table, company_name,
+	//       company_name || ' is a company.',
+	//       '["industry","headquarters_city","year_founded"]'
+	//   ) e ON t.company_name = e.ai_enrich_distinct_key;
+	static const char *kEnrichDistinctMacroSql = R"SQL(
+CREATE OR REPLACE MACRO ai_enrich_distinct(source, key_column, content_expr, schema) AS TABLE
+SELECT key_column AS ai_enrich_distinct_key,
+       ai_enrich(content_expr, schema) AS enrichment
+FROM (
+    SELECT DISTINCT ON (key_column) *
+    FROM query_table(source::VARCHAR)
+) AS ai_enrich_distinct_rows;
+)SQL";
+
+	Connection conn(loader.GetDatabaseInstance());
+	auto macro_result = conn.Query(kEnrichDistinctMacroSql);
+	if (macro_result->HasError()) {
+		throw IOException("duckagent: failed to register ai_enrich_distinct macro: %s", macro_result->GetError());
+	}
 }
 
 void DuckagentExtension::Load(ExtensionLoader &loader) {

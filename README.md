@@ -1,102 +1,144 @@
-# Quack
+# duckagent
 
-This repository is based on https://github.com/duckdb/extension-template, check it out if you want to build and ship your own DuckDB extension.
+🚧 WORK IN PROGRESS 🚧
 
----
+A DuckDB extension that brings local, LLM-powered per-row data enrichment to SQL — no API keys, no cloud calls, no data leaving your machine. Powered by [agent.cpp](https://github.com/mozilla-ai/agent.cpp) and [llama.cpp](https://github.com/ggml-org/llama.cpp) running a GGUF model of your choice.
 
-This extension, Quack, allow you to ... <extension_goal>.
+It implements `ai_enrich`, a scalar function in the spirit of Databricks' [`ai_enrich`](https://docs.databricks.com/) — given a row of content and a schema of fields to fill in, it runs a local model to generate those fields, grammar-constrained to valid structured output.
 
+```sql
+SELECT ai_enrich(
+    'Anthropic is an AI safety company based in San Francisco.',
+    '["industry","headquarters_city"]'
+);
+```
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│ struct(industry varchar, headquarters_city varchar)                        │
+├────────────────────────────────────────────────────────────────────────────┤
+│ {'industry': Artificial Intelligence, 'headquarters_city': San Francisco}  │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Status
+
+This is early, actively-developed v1. It works and produces real results, but the scope is deliberately narrow — see [Known limitations](#known-limitations) and [Roadmap](#roadmap) below before relying on it for anything serious.
+
+## Quick start
+
+### 1. Get a local model
+
+You'll need a GGUF model file. Anything llama.cpp supports works; for `ai_enrich` specifically (short factual field generation, not open-ended chat), a small instruction-tuned model is a good starting point — e.g. Llama 3.2 1B Instruct or Gemma's edge-sized variants, quantized (`Q4_K_M` is a reasonable default). Larger/less-quantized models will generally be more accurate and slower; see [Performance & scaling](#performance--scaling).
+
+### 2. Build
+
+```sh
+GEN=ninja make
+```
+
+This builds all of DuckDB and llama.cpp from source via CMake `FetchContent` — **the first build is slow** regardless of machine. Subsequent builds are incremental and much faster.
+
+The build produces:
+```
+./build/release/duckdb
+./build/release/extension/duckagent/duckagent.duckdb_extension
+```
+
+### 3. Run
+
+```sh
+export DUCKAGENT_MODEL_PATH=/path/to/your-model.gguf
+./build/release/duckdb -unsigned
+```
+
+```sql
+LOAD 'build/release/extension/duckagent/duckagent.duckdb_extension';
+
+SELECT ai_enrich(
+    'Anthropic is an AI safety company based in San Francisco.',
+    '["industry","headquarters_city"]'
+);
+```
+
+`DUCKAGENT_MODEL_PATH` is a temporary placeholder for model configuration until it's wired up as a proper DuckDB `SET` setting — see [Roadmap](#roadmap). The model is loaded lazily, once per process, the first time `ai_enrich` is called.
+
+## `ai_enrich` reference
+
+```sql
+ai_enrich(content VARCHAR, schema VARCHAR) -> STRUCT(...)
+```
+
+- **`content`** — the row's content, as a `VARCHAR`. Build it however makes sense for your data, e.g. `name || ' is a company.'` or `to_json(row)`.
+- **`schema`** — a JSON array of field names to generate, e.g. `'["industry","headquarters_city","year_founded"]'`. Must be a constant string (the return type is resolved from it at query bind time). Every field is generated as `VARCHAR` in this v1 (the "simple schema" form only — see [Known limitations](#known-limitations)).
+- **Returns** — a `STRUCT` with one field per schema entry, in the order given.
+
+### How output quality is protected
+
+Grammar-constrained decoding (a GBNF grammar built per-query from your schema) guarantees the model's output is *syntactically* valid JSON matching your fields — but not that the *content* is sane. On top of that, `ai_enrich`:
+
+- Caps each field value's length during generation, so a model can't ramble indefinitely into a field
+- Runs a sanity check on each generated value (rejects empty values, stray structural characters, URLs, path-like fragments)
+- Automatically retries a row once, at a higher sampling temperature, if any field fails that check — since a small model stuck in a bad deterministic decoding path can often escape it with a different sampling path
+- Falls back to `NULL` for a field that's still bad after the retry, rather than displaying wrong-but-plausible-looking data
+
+None of this can fix a model confidently stating an incorrect fact in a clean, well-formatted way — that's a genuine capability limit of small local models, not something a sanity filter can catch. Bigger/less-quantized models are more accurate; see below.
+
+## Performance & scaling
+
+`ai_enrich` runs a real local LLM generation per call — this is not a free-form SQL function, and won't feel like one. Expect somewhere in the neighborhood of **1–2+ seconds per row** depending on model size, quantization, and hardware. That makes it fine for small tables and ad-hoc lookups, but running it naively over hundreds of thousands of rows can take hours.
+
+**If your enrichment key is low-cardinality** (a company name, a product category, anything with far fewer distinct values than rows), enrich the distinct values once and join back, rather than enriching every row:
+
+```sql
+CREATE TABLE company_enrichment AS
+SELECT DISTINCT company_name,
+       ai_enrich(company_name || ' is a company.',
+                 '["industry","headquarters_city","year_founded"]') AS enrichment
+FROM big_table;
+
+SELECT t.*, e.enrichment.*
+FROM big_table t
+JOIN company_enrichment e USING (company_name);
+```
+
+This turns "N rows" into "N distinct values" — often a 50–200x reduction in real-world data. Materialize it as a table (not a view) so the LLM cost is paid once, and consider an incremental `INSERT ... WHERE NOT EXISTS` pattern to enrich only new distinct values over time rather than re-running from scratch.
+
+If your data is genuinely high-cardinality on every column that matters (free text, unique IDs), this optimization doesn't apply — there's no way around one generation per row in that case with the current architecture.
+
+## Known limitations
+
+This is v1, scoped deliberately narrow:
+
+- **Simple schema only** — `schema` must be a flat JSON array of field names; every field comes back as `VARCHAR`. No typed/nested/enum schema (Databricks' "advanced schema" form) yet.
+- **No grounding** — the model reasons only from `content` and its own training knowledge. No `knowledge_sources` (web search, vector index lookup) yet.
+- **No `options` parameter** — no way to pass custom `instructions` or toggle rationale output yet.
+- **`DUCKAGENT_MODEL_PATH` is an env var**, not a proper extension setting.
+- **Single model path is process-wide** — the first model loaded via `DUCKAGENT_MODEL_PATH` is shared for the life of the process; there's no per-query model override.
+- **Small local models can be confidently wrong** — no fact-checking or grounding exists yet to catch this class of error.
+
+## Roadmap
+
+Roughly in priority order:
+
+- [ ] `ai_enrich_distinct` — a table macro that automates the dedup-then-broadcast pattern above, so users don't have to hand-write it
+- [ ] Per-context thread-count tuning, so DuckDB-level row parallelism scales cleanly instead of each model context competing for the whole machine
+- [ ] `options` parameter (`instructions`, `enableRationale`)
+- [ ] Typed/nested/enum schema (the "advanced schema" form)
+- [ ] `DUCKAGENT_MODEL_PATH` → a real `SET duckagent_model_path` extension setting
+- [ ] `knowledge_sources` (grounding via web search / local vector index)
+- [ ] Pin the `agent.cpp` `FetchContent` dependency to a specific commit for reproducible builds (currently tracks `main`)
+
+## Architecture notes
+
+- Built on the [duckdb/extension-template](https://github.com/duckdb/extension-template) scaffold.
+- Pulls in [agent.cpp](https://github.com/mozilla-ai/agent.cpp) via CMake `FetchContent`, which in turn pulls llama.cpp as its own dependency — both compiled from source as part of the extension build.
+- `agent.cpp` is text-only; it has no multimodal/image input support (confirmed by inspecting its `Model` class directly), so this extension has no vision-related functionality and none is planned around it.
+- Model weights are loaded once per process and shared across queries; each thread gets its own `Model` context (its own KV cache), consistent with DuckDB's per-thread scalar function execution model.
 
 ## Building
-### Managing dependencies
-DuckDB extensions uses VCPKG for dependency management. Enabling VCPKG is very simple: follow the [installation instructions](https://vcpkg.io/en/getting-started) or just run the following:
-```shell
-git clone https://github.com/Microsoft/vcpkg.git
-./vcpkg/bootstrap-vcpkg.sh
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
-Note: VCPKG is only required for extensions that want to rely on it for dependency management. If you want to develop an extension without dependencies, or want to do your own dependency management, just skip this step. Note that the example extension uses VCPKG to build with a dependency for instructive purposes, so when skipping this step the build may not work without removing the dependency.
 
-### Build steps
-Now to build the extension, run:
-```sh
-make
-```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/quack/quack.duckdb_extension
-```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded.
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `quack.duckdb_extension` is the loadable binary as it would be distributed.
+See [Quick start](#quick-start) above for the common path. A few additional notes:
 
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`.
-
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `quack()` that takes a string arguments and returns a string:
-```
-D select quack('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ Quack Jane 🐥 │
-└───────────────┘
-```
-
-## Running the tests
-Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
-```sh
-make test
-```
-
-### Installing the deployed binaries
-To install your extension binaries from S3, you will need to do two things. Firstly, DuckDB should be launched with the
-`allow_unsigned_extensions` option set to true. How to set this will depend on the client you're using. Some examples:
-
-CLI:
-```shell
-duckdb -unsigned
-```
-
-Python:
-```python
-con = duckdb.connect(':memory:', config={'allow_unsigned_extensions' : 'true'})
-```
-
-NodeJS:
-```js
-db = new duckdb.Database(':memory:', {"allow_unsigned_extensions": "true"});
-```
-
-Secondly, you will need to set the repository endpoint in DuckDB to the HTTP url of your bucket + version of the extension
-you want to install. To do this run the following SQL query in DuckDB:
-```sql
-SET custom_extension_repository='bucket.s3.eu-west-1.amazonaws.com/<your_extension_name>/latest';
-```
-Note that the `/latest` path will allow you to install the latest extension version available for your current version of
-DuckDB. To specify a specific version, you can pass the version instead.
-
-After running these steps, you can install and load your extension using the regular INSTALL/LOAD commands in DuckDB:
-```sql
-INSTALL quack;
-LOAD quack;
-```
-
-## Setting up CLion
-
-### Opening project
-Configuring CLion with this extension requires a little work. Firstly, make sure that the DuckDB submodule is available.
-Then make sure to open `./duckdb/CMakeLists.txt` (so not the top level `CMakeLists.txt` file from this repo) as a project in CLion.
-Now to fix your project path go to `tools->CMake->Change Project Root`([docs](https://www.jetbrains.com/help/clion/change-project-root-directory.html)) to set the project root to the root dir of this repo.
-
-### Debugging
-To set up debugging in CLion, there are two simple steps required. Firstly, in `CLion -> Settings / Preferences -> Build, Execution, Deploy -> CMake` you will need to add the desired builds (e.g. Debug, Release, RelDebug, etc). There's different ways to configure this, but the easiest is to leave all empty, except the `build path`, which needs to be set to `../build/{build type}`, and CMake Options to which the following flag should be added, with the path to the extension CMakeList:
-
-```
--DDUCKDB_EXTENSION_CONFIGS=<path_to_the_exentension_CMakeLists.txt>
-```
-
-The second step is to configure the unittest runner as a run/debug configuration. To do this, go to `Run -> Edit Configurations` and click `+ -> Cmake Application`. The target and executable should be `unittest`. This will run all the DuckDB tests. To specify only running the extension specific tests, add `--test-dir ../../.. [sql]` to the `Program Arguments`. Note that it is recommended to use the `unittest` executable for testing/development within CLion. The actual DuckDB CLI currently does not reliably work as a run target in CLion.
+- No VCPKG/external package dependencies are required — the template's original OpenSSL example dependency has been removed since `ai_enrich` doesn't need it.
+- `make test` runs the SQL test suite under `./test/sql`.
+- See `docs/UPDATING.md` for notes on keeping the DuckDB submodule in sync with upstream.
