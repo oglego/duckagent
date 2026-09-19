@@ -2,22 +2,16 @@
 # description: test duckagent extension
 # group: [sql]
 
-# Before we load the extension, this will fail
-statement error
-SELECT duckagent('Sam');
-----
-Catalog Error: Scalar Function with name duckagent does not exist!
-
-# Require statement will ensure this test is run with this extension loaded
+# Require ensures this file runs with the extension loaded.
 require duckagent
 
-# Confirm the extension works
-query I
-SELECT duckagent('Sam');
-----
-...........🦆 Sam
+# The table macro must bind without loading a model or running inference.
+statement ok
+CREATE TABLE enrich_source(key VARCHAR, content VARCHAR);
 
-query I
-SELECT duckagent_openssl_version('Michael') ILIKE 'Duckagent Michael, my linked OpenSSL version is OpenSSL%';
-----
-true
+statement ok
+INSERT INTO enrich_source VALUES ('acme', 'Acme'), ('acme', 'Acme duplicate'), ('beta', 'Beta');
+
+statement ok
+EXPLAIN SELECT *
+FROM ai_enrich_distinct(enrich_source, key, content, '["kind"]');

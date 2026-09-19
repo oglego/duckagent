@@ -27,10 +27,7 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // ai_enrich: bind data
 //===--------------------------------------------------------------------===//
-// Holds the field names parsed out of the `schema` argument at bind time.
-// v1 only supports the "simple schema" form: a flat JSON array of field
-// names, e.g. ["industry","headquarters_country","year_founded"], and every
-// field is generated as VARCHAR. Typed/nested schema is a later addition.
+// Parsed field names for the v1 flat VARCHAR schema.
 struct AIEnrichBindData : public FunctionData {
 	explicit AIEnrichBindData(vector<string> field_names_p) : field_names(std::move(field_names_p)) {
 	}
@@ -50,10 +47,7 @@ struct AIEnrichBindData : public FunctionData {
 //===--------------------------------------------------------------------===//
 // Minimal parser for the "simple schema" form: ["a","b","c"]
 //===--------------------------------------------------------------------===//
-// This intentionally does not depend on the json extension - it is a
-// hand-rolled parser for exactly one shape: a JSON array of string
-// literals. Anything else (the advanced typed/nested schema) throws for
-// now, so behavior is explicit rather than silently wrong.
+// Parses only a JSON array of string literals; typed and nested schemas are unsupported.
 static vector<string> ParseSimpleSchemaFields(const string &schema_json) {
 	vector<string> fields;
 
@@ -120,9 +114,7 @@ static vector<string> ParseSimpleSchemaFields(const string &schema_json) {
 //===--------------------------------------------------------------------===//
 // ai_enrich: bind
 //===--------------------------------------------------------------------===//
-// Resolves the return type (STRUCT with one VARCHAR field per schema entry)
-// at bind time, since `schema` must be a constant argument - matching the
-// Databricks contract that schema is a STRING literal.
+// Resolves the STRUCT return type from the constant schema argument.
 static unique_ptr<FunctionData> AIEnrichBind(ClientContext &context, ScalarFunction &bound_function,
                                               vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() < 2) {
@@ -153,24 +145,12 @@ static unique_ptr<FunctionData> AIEnrichBind(ClientContext &context, ScalarFunct
 //===--------------------------------------------------------------------===//
 // agent.cpp model loading
 //===--------------------------------------------------------------------===//
-// llama_log_set() forwards internally to ggml_log_set() as well, so a
-// single no-op callback silences everything from model-load progress and
-// KV cache messages down to backend-level logs like Metal's
-// "ggml_metal_free: deallocating" - all of which otherwise print straight
-// to stderr with no per-call way to suppress them.
-// TODO: make this configurable (e.g. DUCKAGENT_VERBOSE=1) if the logs turn
-// out to be useful for debugging later.
+// Silence llama.cpp's process-wide diagnostic output.
 static void SilentGgmlLogCallback(ggml_log_level /*level*/, const char * /*text*/, void * /*user_data*/) {
 }
 
-// Weights are the expensive part (the GGUF file itself) and are shared
-// across every ai_enrich call in the process. Each call site gets its own
-// Model (own KV cache/context) via Model::create_with_weights, since
-// contexts aren't safe to share across concurrent DuckDB threads.
-//
-// TODO: replace the DUCKAGENT_MODEL_PATH env var with a proper DuckDB
-// extension setting (e.g. `SET duckagent_model_path = '...'`) once that
-// wiring exists - env var is a placeholder to unblock local development.
+// Share immutable weights across calls; each worker owns its model context.
+// TODO: replace DUCKAGENT_MODEL_PATH with an extension setting.
 static std::shared_ptr<agent_cpp::ModelWeights> GetSharedModelWeights() {
 	static std::mutex weights_mutex;
 	static std::shared_ptr<agent_cpp::ModelWeights> weights;
@@ -201,18 +181,8 @@ static std::shared_ptr<agent_cpp::ModelWeights> GetSharedModelWeights() {
 //===--------------------------------------------------------------------===//
 // GBNF grammar generation
 //===--------------------------------------------------------------------===//
-// Builds a grammar that constrains generation to exactly
-// {"field1":"...", "field2":"...", ...} in schema order, all string values.
-// The `string`/`ws` rules are adapted from llama.cpp's own
-// grammars/json.gbnf reference grammar, with one important addition: a
-// hard length cap on the string body (kEnrichMaxFieldValueLength).
-// agent.cpp's generate loop has no token-count/max-tokens cap of its own
-// (it only stops on EOS or on running out of the full context window), so
-// without this bound a model that doesn't "want" to stop can ramble for
-// hundreds of characters - or run all the way to context exhaustion,
-// getting cut off mid-sentence - while staying perfectly grammar-valid
-// the whole time. This bound is what actually prevents that, independent
-// of which model is loaded.
+// Builds a flat JSON grammar in schema order. The value-length cap prevents
+// grammar-valid but runaway generation.
 static string EscapeGbnfLiteral(const string &field_name) {
 	string escaped;
 	escaped.reserve(field_name.size());
@@ -225,9 +195,7 @@ static string EscapeGbnfLiteral(const string &field_name) {
 	return escaped;
 }
 
-// Max characters (roughly) allowed inside a single field's JSON string
-// value. Generous enough for "San Francisco, California" or a short
-// industry description, tight enough to make runaway generation impossible.
+// Maximum characters in one generated field value.
 static constexpr idx_t kEnrichMaxFieldValueLength = 120;
 
 static string BuildEnrichGrammar(const vector<string> &field_names) {
@@ -384,14 +352,7 @@ static bool TryParseFlatJSONObjectStrings(const string &json, std::unordered_map
 //===--------------------------------------------------------------------===//
 // Sanity check for generated field values
 //===--------------------------------------------------------------------===//
-// Grammar-constrained decoding only guarantees syntactic validity (a legal
-// JSON string), not that the *content* is sane. A weak/small model at
-// temp=0 (fully greedy) can walk into a degenerate path for a fact it
-// doesn't confidently know and produce junk that is still grammar-legal -
-// stray structural characters, echoed prompt fragments, etc. This is a
-// cheap, model-agnostic heuristic to catch that class of failure: a
-// genuine short factual answer ("San Francisco", "Aerospace") should never
-// contain JSON/HTML structural characters or come back empty.
+// Reject common grammar-valid failure modes from small local models.
 static bool LooksGarbled(const string &value) {
 	if (value.empty()) {
 		return true;
@@ -417,10 +378,7 @@ static bool LooksGarbled(const string &value) {
 }
 
 //===--------------------------------------------------------------------===//
-// Runs one full agent turn for a row and parses the result.
-// Returns false if generation threw or the response didn't parse as the
-// flat JSON object our grammar guarantees - callers still need to check
-// individual field values with LooksGarbled() even when this returns true.
+// Runs one agent turn and parses its flat JSON response.
 //===--------------------------------------------------------------------===//
 static bool GenerateEnrichmentFields(agent_cpp::Agent &agent, const string &content,
                                       std::unordered_map<string, string> &out) {
@@ -442,12 +400,7 @@ static bool GenerateEnrichmentFields(agent_cpp::Agent &agent, const string &cont
 //===--------------------------------------------------------------------===//
 // Minor formatting cleanup for otherwise-good generated values
 //===--------------------------------------------------------------------===//
-// Some models prefix numeric-looking values with a stray '+' (e.g. year
-// values come back as "+1916" instead of "1916"). That's cosmetic noise on
-// an otherwise correct value, not the kind of structural problem
-// LooksGarbled() is meant to catch - stripping it here means a good value
-// doesn't get discarded (and potentially replaced by a worse retry) over
-// formatting alone.
+// Remove leading whitespace and a cosmetic '+' from generated values.
 static void NormalizeFieldValue(string &value) {
 	idx_t start = 0;
 	while (start < value.size() &&
@@ -466,14 +419,8 @@ static void NormalizeParsedFields(std::unordered_map<string, string> &fields) {
 }
 
 
-// Holds a fully-configured Agent (model + grammar baked in for this call
-// site's schema, no tools in v1) so it's built once and reused across every
-// DataChunk processed on this thread, not reloaded per row or per chunk.
-// Retry generation uses a nonzero temperature specifically to escape a
-// greedy (temp=0) decode that walked into a degenerate path - a different
-// sampling path is often enough to dodge the same dead end. Only used for
-// fields that fail LooksGarbled() on the primary (temp=0) attempt, so
-// well-behaved rows never pay this extra generation cost.
+// Reuse schema-specific agents for every chunk handled by this worker.
+// Retry rejected values with sampling enabled to escape greedy failures.
 static constexpr float kEnrichRetryTemperature = 0.7F;
 
 struct AIEnrichLocalState : public FunctionLocalState {
@@ -490,16 +437,7 @@ static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &st
 	auto grammar = BuildEnrichGrammar(info.field_names);
 	string instructions = BuildEnrichInstructions(info.field_names);
 
-	// agent.cpp's default ModelConfig::n_threads is
-	// hardware_concurrency() - 1 - i.e. each Model context tries to claim
-	// nearly the whole machine for itself. DuckDB will call this
-	// init-local-state callback once per worker thread when a query runs
-	// in parallel (e.g. scanning a large table), so left at the default,
-	// N parallel DuckDB threads would each spin up a Model context also
-	// trying to grab ~all cores - oversubscribing the machine and making
-	// parallelism actively counterproductive rather than a speedup. Divide
-	// available cores across DuckDB's own configured thread count instead,
-	// so DuckDB-level row parallelism is the thing doing the scaling.
+	// Divide cores across DuckDB workers to avoid oversubscribing the host.
 	auto num_duckdb_threads =
 	    static_cast<idx_t>(std::max<int32_t>(1, TaskScheduler::GetScheduler(state.GetContext()).NumberOfThreads()));
 	auto hw_threads = std::max<unsigned>(1U, std::thread::hardware_concurrency());
@@ -541,13 +479,8 @@ static unique_ptr<FunctionLocalState> AIEnrichInitLocalState(ExpressionState &st
 //===--------------------------------------------------------------------===//
 // ai_enrich: execute
 //===--------------------------------------------------------------------===//
-// Runs one agent turn per row: row content in as the user message,
-// grammar-constrained JSON out, parsed into the STRUCT's child vectors.
-// Any field value that fails LooksGarbled() triggers a single whole-row
-// retry at a nonzero temperature; only the fields that were actually bad
-// are replaced from the retry (good primary values are kept as-is). A
-// field that's still bad after the retry comes back NULL rather than
-// aborting the whole query.
+// Enrich each input row. Rejected primary values get one sampled retry;
+// values still rejected become NULL without failing the query.
 static void AIEnrichFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &info = func_expr.bind_info->Cast<AIEnrichBindData>();
@@ -633,36 +566,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ai_enrich_fun);
 
 	//===----------------------------------------------------------------===//
-	// ai_enrich_distinct: enrich once per distinct key, not once per row
+	// ai_enrich_distinct: enrich one representative row per distinct key.
 	//===----------------------------------------------------------------===//
-	// ai_enrich runs a real LLM generation per call - fine for a handful of
-	// rows, prohibitively slow across e.g. 100K rows of a low-cardinality
-	// column (a company name, a category, a product line) where the actual
-	// number of *distinct* values is a tiny fraction of the row count.
-	//
-	// This macro does the dedup-then-broadcast pattern that pattern calls
-	// for automatically:
-	//   1. SELECT DISTINCT ON (key_column) picks exactly one representative
-	//      row per distinct key value, while keeping every other column
-	//      from that row in scope - so content_expr can reference any
-	//      column of `source`, not just key_column.
-	//   2. ai_enrich runs exactly once per distinct key.
-	//   3. The caller joins the (small) result back onto the full table
-	//      via ai_enrich_distinct_key.
-	//
-	// `source` is passed as a bare relation reference (e.g. a table name);
-	// `source::VARCHAR` yields its qualified name for query_table() to
-	// resolve, following the same convention DuckDB's own built-in table
-	// macros (e.g. histogram_values) use for accepting "any relation".
-	//
-	// Example:
-	//   SELECT t.*, e.enrichment.*
-	//   FROM big_table t
-	//   JOIN ai_enrich_distinct(
-	//       big_table, company_name,
-	//       company_name || ' is a company.',
-	//       '["industry","headquarters_city","year_founded"]'
-	//   ) e ON t.company_name = e.ai_enrich_distinct_key;
+	// `content_expr` may reference any source column. Join the compact result
+	// back to the source through ai_enrich_distinct_key.
 	static const char *kEnrichDistinctMacroSql = R"SQL(
 CREATE OR REPLACE MACRO ai_enrich_distinct(source, key_column, content_expr, schema) AS TABLE
 SELECT key_column AS ai_enrich_distinct_key,

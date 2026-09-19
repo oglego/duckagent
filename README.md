@@ -105,6 +105,21 @@ This turns "N rows" into "N distinct values" — often a 50–200x reduction in 
 
 If your data is genuinely high-cardinality on every column that matters (free text, unique IDs), this optimization doesn't apply — there's no way around one generation per row in that case with the current architecture.
 
+`ai_enrich_distinct` packages the same pattern as a table macro. It returns one enrichment per distinct key; join its result back to the source table:
+
+```sql
+SELECT t.*, e.enrichment.*
+FROM big_table AS t
+JOIN ai_enrich_distinct(
+    big_table,
+    company_name,
+    company_name || ' is a company.',
+    '["industry","headquarters_city","year_founded"]'
+) AS e ON t.company_name = e.ai_enrich_distinct_key;
+```
+
+`content_expr` may use any column from the source relation. Choose a key whose identical values should receive identical enrichment. Use `IS NOT DISTINCT FROM` instead of `=` in the join when the key can be `NULL` and those rows should be retained.
+
 ## Known limitations
 
 This is v1, scoped deliberately narrow:
@@ -120,7 +135,7 @@ This is v1, scoped deliberately narrow:
 
 Roughly in priority order:
 
-- [ ] `ai_enrich_distinct` — a table macro that automates the dedup-then-broadcast pattern above, so users don't have to hand-write it
+- [x] `ai_enrich_distinct` — table macro for deduplicate-then-broadcast enrichment
 - [ ] Per-context thread-count tuning, so DuckDB-level row parallelism scales cleanly instead of each model context competing for the whole machine
 - [ ] `options` parameter (`instructions`, `enableRationale`)
 - [ ] Typed/nested/enum schema (the "advanced schema" form)
