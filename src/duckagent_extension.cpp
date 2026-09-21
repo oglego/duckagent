@@ -9,6 +9,7 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/connection.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "yyjson.hpp"
 
 // agent.cpp - local LLM agent runtime (see CMakeLists.txt FetchContent block)
 #include "agent.h"
@@ -18,11 +19,12 @@
 
 #include <cstdlib>
 #include <mutex>
-#include <unordered_map>
 #include <thread>
 #include <algorithm>
 
 namespace duckdb {
+
+using namespace duckdb_yyjson;
 
 //===--------------------------------------------------------------------===//
 // ai_enrich: bind data
@@ -44,68 +46,27 @@ struct AIEnrichBindData : public FunctionData {
 	}
 };
 
-//===--------------------------------------------------------------------===//
-// Minimal parser for the "simple schema" form: ["a","b","c"]
-//===--------------------------------------------------------------------===//
-// Parses only a JSON array of string literals; typed and nested schemas are unsupported.
+// Parse a flat JSON array of field names.
 static vector<string> ParseSimpleSchemaFields(const string &schema_json) {
-	vector<string> fields;
-
-	idx_t i = 0;
-	auto n = schema_json.size();
-
-	auto SkipWhitespace = [&]() {
-		while (i < n && isspace(static_cast<unsigned char>(schema_json[i]))) {
-			i++;
-		}
-	};
-
-	SkipWhitespace();
-	if (i >= n || schema_json[i] != '[') {
-		throw InvalidInputException(
-		    "ai_enrich: schema must be a JSON array of field names, e.g. [\"industry\",\"year_founded\"]. "
-		    "Typed/nested schemas are not yet supported.");
+	unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(yyjson_read(schema_json.data(), schema_json.size(), 0),
+	                                                       yyjson_doc_free);
+	auto root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+	if (!root || !yyjson_is_arr(root)) {
+		throw InvalidInputException("ai_enrich: schema must be a JSON array of field names");
 	}
-	i++; // consume '['
-
-	SkipWhitespace();
-	if (i < n && schema_json[i] == ']') {
+	if (yyjson_arr_size(root) == 0) {
 		throw InvalidInputException("ai_enrich: schema array must contain at least one field name");
 	}
 
-	while (i < n) {
-		SkipWhitespace();
-		if (i >= n || schema_json[i] != '"') {
-			throw InvalidInputException("ai_enrich: expected a quoted field name in schema at position %llu",
-			                             (unsigned long long)i);
+	vector<string> fields;
+	fields.reserve(yyjson_arr_size(root));
+	size_t index, max;
+	yyjson_val *value;
+	yyjson_arr_foreach(root, index, max, value) {
+		if (!yyjson_is_str(value) || yyjson_get_len(value) == 0) {
+			throw InvalidInputException("ai_enrich: schema fields must be non-empty strings");
 		}
-		i++; // consume opening quote
-		string field;
-		while (i < n && schema_json[i] != '"') {
-			// no escape-sequence handling needed for v1 field names
-			field += schema_json[i];
-			i++;
-		}
-		if (i >= n) {
-			throw InvalidInputException("ai_enrich: unterminated string in schema");
-		}
-		i++; // consume closing quote
-		if (field.empty()) {
-			throw InvalidInputException("ai_enrich: schema field names cannot be empty");
-		}
-		fields.push_back(field);
-
-		SkipWhitespace();
-		if (i < n && schema_json[i] == ',') {
-			i++;
-			continue;
-		}
-		if (i < n && schema_json[i] == ']') {
-			i++;
-			break;
-		}
-		throw InvalidInputException("ai_enrich: malformed schema, expected ',' or ']' at position %llu",
-		                             (unsigned long long)i);
+		fields.emplace_back(yyjson_get_str(value), yyjson_get_len(value));
 	}
 
 	return fields;
@@ -235,118 +196,24 @@ static string BuildEnrichInstructions(const vector<string> &field_names) {
 	return instructions;
 }
 
-//===--------------------------------------------------------------------===//
-// Minimal parser for the flat JSON object our grammar guarantees:
-// {"a":"b","c":"d"}. Not a general JSON parser - deliberately only handles
-// the shape the grammar can produce.
-//===--------------------------------------------------------------------===//
-static bool TryParseFlatJSONObjectStrings(const string &json, std::unordered_map<string, string> &out) {
-	idx_t i = 0;
-	auto n = json.size();
-
-	auto SkipWhitespace = [&]() {
-		while (i < n && isspace(static_cast<unsigned char>(json[i]))) {
-			i++;
-		}
-	};
-
-	auto ParseString = [&](string &value) -> bool {
-		SkipWhitespace();
-		if (i >= n || json[i] != '"') {
-			return false;
-		}
-		i++;
-		value.clear();
-		while (i < n && json[i] != '"') {
-			char c = json[i];
-			if (c == '\\') {
-				i++;
-				if (i >= n) {
-					return false;
-				}
-				switch (json[i]) {
-				case '"':
-					value += '"';
-					break;
-				case '\\':
-					value += '\\';
-					break;
-				case '/':
-					value += '/';
-					break;
-				case 'n':
-					value += '\n';
-					break;
-				case 't':
-					value += '\t';
-					break;
-				case 'r':
-					value += '\r';
-					break;
-				case 'b':
-					value += '\b';
-					break;
-				case 'f':
-					value += '\f';
-					break;
-				case 'u':
-					// TODO: decode \uXXXX properly; skip for v1.
-					i += 4;
-					break;
-				default:
-					value += json[i];
-				}
-				i++;
-			} else {
-				value += c;
-				i++;
-			}
-		}
-		if (i >= n) {
-			return false;
-		}
-		i++; // consume closing quote
-		return true;
-	};
-
-	SkipWhitespace();
-	if (i >= n || json[i] != '{') {
+// Parses the grammar-constrained response into schema order.
+static bool TryParseEnrichmentFields(const string &json, const vector<string> &field_names, vector<string> &out) {
+	unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(yyjson_read(json.data(), json.size(), 0), yyjson_doc_free);
+	auto root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+	if (!root || !yyjson_is_obj(root) || yyjson_obj_size(root) != field_names.size()) {
 		return false;
 	}
-	i++;
-	SkipWhitespace();
-	if (i < n && json[i] == '}') {
-		return true; // empty object
-	}
 
-	while (i < n) {
-		string key;
-		if (!ParseString(key)) {
+	out.clear();
+	out.reserve(field_names.size());
+	for (const auto &field : field_names) {
+		auto value = yyjson_obj_getn(root, field.data(), field.size());
+		if (!yyjson_is_str(value)) {
 			return false;
 		}
-		SkipWhitespace();
-		if (i >= n || json[i] != ':') {
-			return false;
-		}
-		i++;
-		string value;
-		if (!ParseString(value)) {
-			return false;
-		}
-		out[key] = value;
-
-		SkipWhitespace();
-		if (i < n && json[i] == ',') {
-			i++;
-			SkipWhitespace();
-			continue;
-		}
-		if (i < n && json[i] == '}') {
-			return true;
-		}
-		return false;
+		out.emplace_back(yyjson_get_str(value), yyjson_get_len(value));
 	}
-	return false;
+	return true;
 }
 
 //===--------------------------------------------------------------------===//
@@ -381,7 +248,7 @@ static bool LooksGarbled(const string &value) {
 // Runs one agent turn and parses its flat JSON response.
 //===--------------------------------------------------------------------===//
 static bool GenerateEnrichmentFields(agent_cpp::Agent &agent, const string &content,
-                                      std::unordered_map<string, string> &out) {
+                                      const vector<string> &field_names, vector<string> &out) {
 	std::vector<common_chat_msg> messages;
 	common_chat_msg user_msg;
 	user_msg.role = "user";
@@ -394,7 +261,7 @@ static bool GenerateEnrichmentFields(agent_cpp::Agent &agent, const string &cont
 	} catch (const agent_cpp::Error &e) {
 		return false;
 	}
-	return TryParseFlatJSONObjectStrings(response_text, out);
+	return TryParseEnrichmentFields(response_text, field_names, out);
 }
 
 //===--------------------------------------------------------------------===//
@@ -412,9 +279,9 @@ static void NormalizeFieldValue(string &value) {
 	}
 }
 
-static void NormalizeParsedFields(std::unordered_map<string, string> &fields) {
-	for (auto &entry : fields) {
-		NormalizeFieldValue(entry.second);
+static void NormalizeFields(vector<string> &fields) {
+	for (auto &field : fields) {
+		NormalizeFieldValue(field);
 	}
 }
 
@@ -507,46 +374,39 @@ static void AIEnrichFun(DataChunk &args, ExpressionState &state, Vector &result)
 		}
 		string row_content = content_values[content_idx].GetString();
 
-		std::unordered_map<string, string> primary;
-		bool primary_ok = GenerateEnrichmentFields(*lstate.agent, row_content, primary);
+		vector<string> primary;
+		bool primary_ok = GenerateEnrichmentFields(*lstate.agent, row_content, info.field_names, primary);
 		if (primary_ok) {
-			NormalizeParsedFields(primary);
+			NormalizeFields(primary);
 		}
 
-		bool any_field_needs_retry = false;
-		for (auto &field : info.field_names) {
-			auto it = primary_ok ? primary.find(field) : primary.end();
-			if (it == primary.end() || LooksGarbled(it->second)) {
-				any_field_needs_retry = true;
-				break;
+		bool needs_retry = !primary_ok;
+		for (const auto &field : primary) {
+			needs_retry = needs_retry || LooksGarbled(field);
+		}
+
+		vector<string> retry;
+		bool retry_ok = false;
+		if (needs_retry) {
+			retry_ok = GenerateEnrichmentFields(*lstate.retry_agent, row_content, info.field_names, retry);
+			if (retry_ok) {
+				NormalizeFields(retry);
 			}
-		}
-
-		std::unordered_map<string, string> retry;
-		if (any_field_needs_retry) {
-			GenerateEnrichmentFields(*lstate.retry_agent, row_content, retry);
-			NormalizeParsedFields(retry);
-			// Result (success or failure) is checked per-field below; a
-			// failed/garbled retry for a given field just leaves it NULL.
 		}
 
 		for (idx_t child_idx = 0; child_idx < child_entries.size(); child_idx++) {
 			auto &child_vector = *child_entries[child_idx];
 			auto child_data = FlatVector::GetData<string_t>(child_vector);
-			const auto &field = info.field_names[child_idx];
-
-			auto primary_it = primary_ok ? primary.find(field) : primary.end();
-			bool primary_good = primary_it != primary.end() && !LooksGarbled(primary_it->second);
+			bool primary_good = primary_ok && !LooksGarbled(primary[child_idx]);
 
 			if (primary_good) {
-				child_data[row] = StringVector::AddString(child_vector, primary_it->second);
+				child_data[row] = StringVector::AddString(child_vector, primary[child_idx]);
 				continue;
 			}
 
-			auto retry_it = retry.find(field);
-			bool retry_good = retry_it != retry.end() && !LooksGarbled(retry_it->second);
+			bool retry_good = retry_ok && !LooksGarbled(retry[child_idx]);
 			if (retry_good) {
-				child_data[row] = StringVector::AddString(child_vector, retry_it->second);
+				child_data[row] = StringVector::AddString(child_vector, retry[child_idx]);
 			} else {
 				FlatVector::SetNull(child_vector, row, true);
 			}

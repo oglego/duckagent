@@ -47,6 +47,8 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # into both the static library and the loadable extension.
 target_link_libraries(${EXTENSION_NAME} agent-cpp::agent)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} agent-cpp::agent)
+target_include_directories(${EXTENSION_NAME} PRIVATE duckdb/third_party/yyjson/include)
+target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE duckdb/third_party/yyjson/include)
 
 install(
   TARGETS ${EXTENSION_NAME}
